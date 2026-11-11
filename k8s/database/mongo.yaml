@@ -1,0 +1,183 @@
+# MongoDB as a 3-member REPLICA SET (rs0), one member per node.
+#
+# Why: in Ginflix a single database pod is a single point of failure. Its
+# data sits on one node's disk (kind's local-path storage), so if that node
+# dies, Kubernetes cannot move the pod elsewhere. With a replica set, each
+# member keeps a full copy; if the primary's node dies, the two survivors
+# elect a new primary in ~10-15 s and the backend driver follows it.
+#
+# The database is NOT exposed: headless ClusterIP service only, plus
+# NetworkPolicies (security/network-policies.yaml) allowing only the backend.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mongo
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo-hl
+  labels:
+    app: mongo
+spec:
+  clusterIP: None                 # headless: one stable DNS name per pod
+  publishNotReadyAddresses: true  # members must resolve each other while starting
+  selector:
+    app: mongo
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: 27017
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongo
+  labels:
+    app: mongo
+spec:
+  serviceName: mongo-hl
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: mongo
+  template:
+    metadata:
+      labels:
+        app: mongo
+    spec:
+      serviceAccountName: mongo
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999       # "mongodb" user of the official image
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          # HARD rule: never two members on the same node, otherwise one node
+          # failure could take out the majority.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mongo
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        # mongod refuses a keyfile readable by group/others; Secret volumes are
+        # group-readable when fsGroup is set, so copy it with mode 0400.
+        - name: keyfile
+          image: mongo:7.0
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "cp /secret/keyfile /keyfile/keyfile && chmod 0400 /keyfile/keyfile"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+          volumeMounts:
+            - name: keyfile-secret
+              mountPath: /secret
+              readOnly: true
+            - name: keyfile
+              mountPath: /keyfile
+      containers:
+        - name: mongo
+          image: mongo:7.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --replSet
+            - rs0
+            - --bind_ip_all
+            - --keyFile             # members authenticate each other with this shared key
+            - /keyfile/keyfile
+            - --wiredTigerCacheSizeGB
+            - "0.25"
+          env:
+            # Used by the image entrypoint on FIRST start only, to create the root user.
+            - name: MONGO_INITDB_ROOT_USERNAME
+              valueFrom:
+                secretKeyRef: { name: mongo-credentials, key: root-username }
+            - name: MONGO_INITDB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: mongo-credentials, key: root-password }
+            - name: HOME
+              value: /tmp
+          ports:
+            - name: mongo
+              containerPort: 27017
+          startupProbe:
+            tcpSocket: { port: 27017 }
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            tcpSocket: { port: 27017 }
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--norc", "--eval", "db.adminCommand({ ping: 1 }).ok"]
+            periodSeconds: 10
+            timeoutSeconds: 8
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 100m, memory: 384Mi }
+            limits: { cpu: "1", memory: 768Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+            - name: configdb
+              mountPath: /data/configdb
+            - name: keyfile
+              mountPath: /keyfile
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: keyfile-secret
+          secret:
+            secretName: mongo-credentials
+            items:
+              - key: keyfile
+                path: keyfile
+        - name: keyfile
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: configdb
+          emptyDir: { sizeLimit: 10Mi }
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+# Voluntary disruptions (kubectl drain, upgrades) may take down at most one
+# member at a time, so the replica set always keeps its majority (2 of 3).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mongo
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: mongo

@@ -1,0 +1,176 @@
+# Zero-trust networking inside the namespace:
+# 1. deny everything (ingress and egress) by default,
+# 2. allow DNS,
+# 3. open exactly the flows the architecture needs.
+#
+#   reverse proxy -> frontend, coach, backend, media   (port 8080, via NodePort)
+#   backend  -> mongo:27017, garage:3900 (S3 API)
+#   media    -> garage:3902 (read-only web endpoint)
+#   mongo   <-> mongo:27017 (replication),  mongo-init -> mongo:27017
+#   garage  <-> garage:3901 (replication RPC)
+#
+# Requires a CNI that enforces NetworkPolicy: kindnet in recent kind
+# releases does, otherwise install Cilium/Calico (see README).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+# Public entry points. Traffic arrives through NodePorts from the reverse
+# proxy (outside the cluster), so the source cannot be narrowed to a pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-public-http
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: ["frontend", "coach", "backend", "media"]
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - { protocol: TCP, port: 8080 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-egress
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: mongo
+      ports:
+        - { protocol: TCP, port: 27017 }
+    - to:
+        - podSelector:
+            matchLabels:
+              app: garage
+      ports:
+        - { protocol: TCP, port: 3900 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: media-egress
+spec:
+  podSelector:
+    matchLabels:
+      app: media
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: garage
+      ports:
+        - { protocol: TCP, port: 3902 }
+---
+# The database only accepts the backend, the init Job and its own members.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mongo
+spec:
+  podSelector:
+    matchLabels:
+      app: mongo
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: ["backend", "mongo", "mongo-init"]
+      ports:
+        - { protocol: TCP, port: 27017 }
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: mongo
+      ports:
+        - { protocol: TCP, port: 27017 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mongo-init-egress
+spec:
+  podSelector:
+    matchLabels:
+      app: mongo-init
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: mongo
+      ports:
+        - { protocol: TCP, port: 27017 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: garage
+spec:
+  podSelector:
+    matchLabels:
+      app: garage
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: backend
+      ports:
+        - { protocol: TCP, port: 3900 }
+    - from:
+        - podSelector:
+            matchLabels:
+              app: media
+      ports:
+        - { protocol: TCP, port: 3902 }
+    - from:
+        - podSelector:
+            matchLabels:
+              app: garage
+      ports:
+        - { protocol: TCP, port: 3901 }
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: garage
+      ports:
+        - { protocol: TCP, port: 3901 }

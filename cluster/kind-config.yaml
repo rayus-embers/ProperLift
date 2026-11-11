@@ -1,0 +1,25 @@
+# Local Kubernetes cluster: 1 control plane + 3 workers (each worker is a
+# Docker container emulating a server). Each worker gets its own "zone"
+# label so the manifests can spread replicas the way they would across
+# availability zones in a real cloud.
+#
+#   kind create cluster --config cluster/kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: properlift
+# To use Cilium instead of kindnet (as in the course), uncomment and then
+# install Cilium before deploying:
+# networking:
+#   disableDefaultCNI: true
+#   kubeProxyMode: none
+nodes:
+  - role: control-plane
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: zone-a
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: zone-b
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: zone-c

@@ -1,0 +1,35 @@
+# Deploy everything with:   kubectl apply -k k8s/
+# Preview the result with:  kubectl kustomize k8s/
+#
+# Secrets are NOT part of this list: they are generated on the VM by
+# scripts/03-create-secrets.sh so no password ever lands in git.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: properlift
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: properlift
+    includeSelectors: false
+    includeTemplates: true
+
+resources:
+  - 00-namespace.yaml
+  - config/app-config.yaml
+  - security/network-policies.yaml
+  - database/mongo.yaml
+  - database/mongo-init-job.yaml
+  - storage/garage.yaml
+  - backend/backend.yaml
+  - media/media.yaml
+  - frontend/frontend.yaml
+  - coach/coach.yaml
+
+# garage.toml becomes a ConfigMap whose name includes a hash of its content.
+# Editing the file therefore changes the name and triggers a rolling restart
+# of Garage automatically.
+configMapGenerator:
+  - name: garage-config
+    files:
+      - storage/garage.toml

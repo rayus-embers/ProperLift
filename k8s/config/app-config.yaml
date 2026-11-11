@@ -1,0 +1,45 @@
+# Non-sensitive configuration. Passwords and keys live in Secrets created by
+# scripts/03-create-secrets.sh (never committed to git).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+data:
+  PORT: "8080"
+  S3_ENDPOINT: "http://garage.properlift.svc.cluster.local:3900"
+  S3_REGION: "garage"
+  S3_BUCKET: "properlift-media"
+  MEDIA_PUBLIC_BASE: "/media"
+  MAX_UPLOAD_MB: "50"
+  JWT_TTL: "12h"
+  SEED_COACH_NAME: "Head Coach"
+  SEED_DEMO_CONTENT: "true"
+---
+# Runtime config for the browser apps, mounted as /config.js
+# (same idea as BACKEND_URL / STREAM_URL in Ginflix). Because the reverse
+# proxy serves /api and /media on the same domain, relative URLs are enough.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+data:
+  config.js: |
+    window.APP_CONFIG = {
+      appName: 'Proper Lift',
+      apiBase: '/api',
+      mediaBase: '/media',
+      tokenKey: 'properlift.client.token',
+    };
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coach-config
+data:
+  config.js: |
+    window.APP_CONFIG = {
+      appName: 'Proper Lift',
+      apiBase: '/api',
+      mediaBase: '/media',
+      tokenKey: 'properlift.coach.token',
+    };

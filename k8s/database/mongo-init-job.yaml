@@ -1,0 +1,149 @@
+# One-shot Job that (1) initiates the replica set and (2) creates the
+# least-privilege "properlift" user the backend connects with. Both steps are
+# idempotent, so the Job can safely run again (it is re-created by
+# "kubectl apply -k" after its TTL expires).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mongo-init
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mongo-init-scripts
+data:
+  init.sh: |
+    #!/bin/bash
+    set -uo pipefail
+    NS="${POD_NAMESPACE:-properlift}"
+    fqdn() { echo "mongo-$1.mongo-hl.${NS}.svc.cluster.local:27017"; }
+
+    for i in 0 1 2; do
+      until mongosh --quiet --norc "mongodb://$(fqdn "$i")/admin?directConnection=true" \
+            --eval 'db.adminCommand({ ping: 1 }).ok' >/dev/null 2>&1; do
+        echo "waiting for mongo-$i ..."
+        sleep 3
+      done
+    done
+    echo "all 3 members are reachable"
+
+    mongosh --quiet --norc "mongodb://$(fqdn 0)/admin?directConnection=true" \
+      --file /scripts/initiate.js || exit 1
+
+    RS_URI="mongodb://$(fqdn 0),$(fqdn 1),$(fqdn 2)/admin?replicaSet=rs0"
+    for attempt in $(seq 1 30); do
+      if mongosh --quiet --norc "$RS_URI" --file /scripts/users.js; then
+        echo "mongo bootstrap complete"
+        exit 0
+      fi
+      echo "user setup not possible yet (attempt $attempt), retrying ..."
+      sleep 5
+    done
+    exit 1
+
+  initiate.js: |
+    // Credentials come from environment variables (not the command line).
+    const admin = db.getSiblingDB('admin');
+    admin.auth(process.env.MONGO_INITDB_ROOT_USERNAME, process.env.MONGO_INITDB_ROOT_PASSWORD);
+    const ns = process.env.POD_NAMESPACE || 'properlift';
+    const host = (i) => `mongo-${i}.mongo-hl.${ns}.svc.cluster.local:27017`;
+
+    let status;
+    try {
+      status = admin.runCommand({ replSetGetStatus: 1 });
+    } catch (e) {
+      status = { ok: 0, code: e.code, codeName: e.codeName, errmsg: e.message };
+    }
+    if (status.ok === 1) {
+      print(`replica set already initiated (${status.members.length} members)`);
+    } else if (status.code === 94 || status.codeName === 'NotYetInitialized') {
+      const res = admin.runCommand({
+        replSetInitiate: { _id: 'rs0', members: [0, 1, 2].map((i) => ({ _id: i, host: host(i) })) },
+      });
+      printjson(res);
+      if (res.ok !== 1) quit(1);
+      print('replica set initiated');
+    } else {
+      printjson(status);
+      quit(1);
+    }
+
+  users.js: |
+    const admin = db.getSiblingDB('admin');
+    admin.auth(process.env.MONGO_INITDB_ROOT_USERNAME, process.env.MONGO_INITDB_ROOT_PASSWORD);
+    if (!admin.runCommand({ hello: 1 }).isWritablePrimary) {
+      print('no primary yet');
+      quit(1);
+    }
+    const appDb = db.getSiblingDB('properlift');
+    const spec = { pwd: process.env.APP_PASSWORD, roles: [{ role: 'readWrite', db: 'properlift' }] };
+    if (appDb.getUser('properlift')) {
+      appDb.updateUser('properlift', spec);
+      print('user properlift updated');
+    } else {
+      appDb.createUser({ user: 'properlift', ...spec });
+      print('user properlift created');
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mongo-init
+spec:
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: mongo-init
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: mongo-init
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: init
+          image: mongo:7.0
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "/scripts/init.sh"]
+          env:
+            - name: HOME
+              value: /tmp
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: { fieldPath: metadata.namespace }
+            - name: MONGO_INITDB_ROOT_USERNAME
+              valueFrom:
+                secretKeyRef: { name: mongo-credentials, key: root-username }
+            - name: MONGO_INITDB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: mongo-credentials, key: root-password }
+            - name: APP_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: mongo-credentials, key: app-password }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: scripts
+          configMap:
+            name: mongo-init-scripts
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }

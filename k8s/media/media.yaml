@@ -1,0 +1,169 @@
+# Media service: the equivalent of the Ginflix "streamer". An unprivileged
+# nginx that serves exercise videos and meal photos from Garage, read-only.
+# nginx passes HTTP Range requests through, so browsers can seek in videos.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: media
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: media-nginx
+data:
+  default.conf: |
+    server {
+        listen 8080;
+        server_name _;
+        server_tokens off;
+
+        location = /healthz {
+            access_log off;
+            default_type text/plain;
+            return 200 "ok\n";
+        }
+
+        # /media/uploads/2026/11/abc.mp4  ->  Garage web endpoint, key uploads/2026/11/abc.mp4
+        location /media/ {
+            limit_except GET HEAD { deny all; }   # read-only, uploads go through the backend
+            proxy_pass http://garage.properlift.svc.cluster.local:3902/;
+            proxy_set_header Host properlift-media.web.garage;   # bucket name + root_domain
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_connect_timeout 3s;
+            proxy_next_upstream error timeout http_502 http_503;
+            proxy_hide_header x-amz-request-id;
+            proxy_hide_header x-amz-id-2;
+            add_header Cache-Control "public, max-age=86400" always;
+            add_header X-Content-Type-Options "nosniff" always;
+        }
+
+        location / {
+            return 404;
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: media
+  labels:
+    app: media
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels:
+      app: media
+  template:
+    metadata:
+      labels:
+        app: media
+    spec:
+      serviceAccountName: media
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101     # "nginx" user of the unprivileged image
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: media
+      tolerations:
+        - { key: node.kubernetes.io/not-ready, operator: Exists, effect: NoExecute, tolerationSeconds: 30 }
+        - { key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 30 }
+      containers:
+        - name: nginx
+          image: nginxinc/nginx-unprivileged:1.28-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NGINX_ENTRYPOINT_QUIET_LOGS
+              value: "1"
+          ports:
+            - name: http
+              containerPort: 8080
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { cpu: 500m, memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: conf
+          configMap:
+            name: media-nginx
+        - name: tmp
+          emptyDir: { sizeLimit: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: media
+  labels:
+    app: media
+spec:
+  type: NodePort
+  selector:
+    app: media
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      nodePort: 30083
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: media
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: media
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: media
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: media
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

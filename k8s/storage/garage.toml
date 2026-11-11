@@ -1,0 +1,36 @@
+# Garage configuration (S3-compatible object storage), replacing the S3
+# service the professor hosted. Secrets (rpc_secret, admin_token,
+# metrics_token) are NOT here: Garage reads them from the environment
+# variables GARAGE_RPC_SECRET / GARAGE_ADMIN_TOKEN / GARAGE_METRICS_TOKEN,
+# which come from the "garage-secrets" Kubernetes Secret.
+
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "lmdb"
+metadata_auto_snapshot_interval = "6h"
+
+# Every object is stored on 3 nodes; reads and writes need 2 of 3 (quorum),
+# so the storage keeps working when one node is down.
+replication_factor = 3
+consistency_mode = "consistent"
+
+rpc_bind_addr = "0.0.0.0:3901"
+
+# Filled in by scripts/05-bootstrap-garage.sh once the node IDs are known,
+# so nodes can find each other again after a full cluster restart.
+bootstrap_peers = []
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "0.0.0.0:3900"
+root_domain = ".s3.garage"
+
+# "Website" endpoint: serves objects of buckets with website access enabled,
+# read-only and without credentials. The media service proxies it.
+[s3_web]
+bind_addr = "0.0.0.0:3902"
+root_domain = ".web.garage"
+index = "index.html"
+
+[admin]
+api_bind_addr = "0.0.0.0:3903"

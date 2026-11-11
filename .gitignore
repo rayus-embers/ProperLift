@@ -1,0 +1,5 @@
+# Generated credentials and certificates: never commit
+.secrets/
+proxy/certs/
+proxy/generated/
+node_modules/

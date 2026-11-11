@@ -1,0 +1,123 @@
+# Reverse proxy in front of the kind cluster (same role as the nginx on the
+# course VM). Kind nodes are Docker containers with private IPs, reachable
+# from the VM but not from your laptop, so this proxy is the bridge.
+#
+# It runs as a Docker container attached to the "kind" Docker network, which
+# lets it address the nodes by container name (__CLUSTER__-worker, ...).
+# Placeholders __DOMAIN__, __COACH_DOMAIN__, __CLUSTER__ are filled in by
+# scripts/07-proxy.sh.
+#
+# Reliability: every upstream lists ALL worker nodes. NodePort services
+# answer on every node, so if one node dies nginx marks it down
+# (max_fails/fail_timeout) and retries the request on the next node.
+
+resolver 127.0.0.11 valid=10s ipv6=off;   
+
+upstream fc_frontend {
+    zone fc_frontend 64k;
+    server __CLUSTER__-worker:30080  resolve max_fails=1 fail_timeout=10s;
+    server __CLUSTER__-worker2:30080 resolve max_fails=1 fail_timeout=10s;
+    server __CLUSTER__-worker3:30080 resolve max_fails=1 fail_timeout=10s;
+    keepalive 16;
+}
+upstream fc_coach {
+    zone fc_coach 64k;
+    server __CLUSTER__-worker:30081  resolve max_fails=1 fail_timeout=10s;
+    server __CLUSTER__-worker2:30081 resolve max_fails=1 fail_timeout=10s;
+    server __CLUSTER__-worker3:30081 resolve max_fails=1 fail_timeout=10s;
+    keepalive 8;
+}
+upstream fc_backend {
+    zone fc_backend 64k;
+    server __CLUSTER__-worker:30082  resolve max_fails=1 fail_timeout=10s;
+    server __CLUSTER__-worker2:30082 resolve max_fails=1 fail_timeout=10s;
+    server __CLUSTER__-worker3:30082 resolve max_fails=1 fail_timeout=10s;
+    keepalive 32;
+}
+upstream fc_media {
+    zone fc_media 64k;
+    server __CLUSTER__-worker:30083  resolve max_fails=1 fail_timeout=10s;
+    server __CLUSTER__-worker2:30083 resolve max_fails=1 fail_timeout=10s;
+    server __CLUSTER__-worker3:30083 resolve max_fails=1 fail_timeout=10s;
+    keepalive 16;
+}
+
+# Shared proxy settings
+proxy_http_version 1.1;
+proxy_set_header Connection "";
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_connect_timeout 2s;          
+proxy_read_timeout 60s;
+proxy_next_upstream error timeout http_502 http_503 http_504;   
+proxy_next_upstream_tries 3;
+proxy_next_upstream_timeout 10s;
+
+server_tokens off;
+client_max_body_size 1m;
+limit_req_zone $binary_remote_addr zone=fc_auth:10m rate=10r/m;
+
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_prefer_server_ciphers off;
+ssl_session_cache shared:fc_ssl:10m;
+ssl_certificate     /etc/nginx/certs/properlift.crt;
+ssl_certificate_key /etc/nginx/certs/properlift.key;
+
+# HTTP -> HTTPS
+server {
+    listen 80 default_server;
+    server_name _;
+    location / { return 301 https://$host$request_uri; }
+}
+
+# Client site: https://__DOMAIN__
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name __DOMAIN__;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    location / {
+        proxy_pass http://fc_frontend;
+    }
+    location /api/auth/ {
+        limit_req zone=fc_auth burst=10 nodelay;
+        proxy_pass http://fc_backend;
+    }
+    location /api/ {
+        proxy_pass http://fc_backend;
+    }
+    location /media/ {
+        proxy_pass http://fc_media;
+    }
+}
+
+# Coach dashboard: https://__COACH_DOMAIN__
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name __COACH_DOMAIN__;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    location / {
+        proxy_pass http://fc_coach;
+    }
+    location /api/auth/ {
+        limit_req zone=fc_auth burst=10 nodelay;
+        proxy_pass http://fc_backend;
+    }
+    location = /api/coach/media {
+        client_max_body_size 55m;      # video uploads (backend limit: 50 MB)
+        proxy_request_buffering off;
+        proxy_read_timeout 300s;
+        proxy_pass http://fc_backend;
+    }
+    location /api/ {
+        proxy_pass http://fc_backend;
+    }
+    location /media/ {
+        proxy_pass http://fc_media;
+    }
+}
