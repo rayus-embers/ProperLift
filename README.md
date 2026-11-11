@@ -82,13 +82,6 @@ triggers a rolling restart), idempotent bootstrap Jobs/scripts.
 
 ## Design
 
-Black-and-gold "iron club" identity, built from scratch (no third-party logos):
-a spinning weight-plate emblem with lettering around the rim, word-by-word headline
-reveal with a moving gold sheen, a scrolling slogan band, cards that tilt toward the
-pointer, scroll-triggered reveals, counters that count up, a calorie ring, a weight
-chart that draws itself, and a gold burst when a session is logged. All motion
-switches off for users who ask their system for reduced motion.
-
 Fonts (Inter, Inter Display and a renamed Lora Italic) are subset and **self-hosted**
 in `apps/shared/fonts/` under the SIL Open Font License (see `LICENSE-OFL.txt`), so the
 strict Content-Security-Policy stays `'self'`-only: no Google Fonts or CDN calls.
